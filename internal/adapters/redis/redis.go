@@ -8,15 +8,10 @@ import (
 )
 
 func NewClient(addr string) *goredis.Client {
-	rdb := goredis.NewClient(&goredis.Options{
-		Addr: addr,
-	})
-
-	ctx := context.Background()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
+	rdb := goredis.NewClient(&goredis.Options{Addr: addr})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("redis ping: %v", err)
 	}
-
 	log.Printf("connected to redis at %s", addr)
 
 	return rdb
