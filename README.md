@@ -3,12 +3,10 @@
 A cinema ticket booking application built with Go.
 
 ## Tech Stack
-- **Language**: Go v1.26.4
-- **Containerization**: Docker v29.6.1
+- Go v1.26.4
+- Docker v29.6.1
 
 ## Quick Start
-
-### Installation & Running
 
 1. **Clone the repository**:
 ```bash
@@ -23,11 +21,10 @@ docker compose up -d
 
 3. **Run the application**:
 ```bash
-go run cmd/main.go
+go run cmd/*.go
 ```
 
 4. **Access the application**:
-Open your browser and navigate to:
 ```
 http://localhost:8080
 ```
