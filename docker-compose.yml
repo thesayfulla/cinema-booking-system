@@ -1,17 +1,42 @@
 services:
-  redis:
-    container_name: redis
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  redis-commander:
-    container_name: redis-commander
-    hostname: redis-commander
-    image: rediscommander/redis-commander:latest
-    restart: always
+  postgres:
+    container_name: cinema-postgres
+    image: postgres:17-alpine
     environment:
-      - REDIS_HOSTS=local:redis:6379
+      POSTGRES_USER: cinema
+      POSTGRES_PASSWORD: cinema
+      POSTGRES_DB: cinema
     ports:
-      - "8081:8081"
-    user: "redis"
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # The api waits on this, so a cold start migrates against a ready database.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinema -d cinema"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    container_name: cinema-api
+    build:
+      context: .
+    environment:
+      APP_ENV: development
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://cinema:cinema@postgres:5432/cinema?sslmode=disable
+      DB_AUTO_MIGRATE: "true"
+      SEED_DEMO_DATA: "true"
+      PAYMENT_PROVIDER: mock
+      PAYMENT_WEBHOOK_SECRET: dev-webhook-secret
+      PAYMENT_TEST_ENDPOINTS: "true"
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

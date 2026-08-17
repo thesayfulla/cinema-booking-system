@@ -2,84 +2,124 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"log/slog"
 
-	"github.com/thesayfulla/cinema-booking-system/internal/adapters/http"
-	redisAdapter "github.com/thesayfulla/cinema-booking-system/internal/adapters/redis"
-	"github.com/thesayfulla/cinema-booking-system/internal/adapters/repository/memory"
-	"github.com/thesayfulla/cinema-booking-system/internal/adapters/repository/redis"
+	httpadapter "github.com/thesayfulla/cinema-booking-system/internal/adapters/http"
+	"github.com/thesayfulla/cinema-booking-system/internal/adapters/payment/mock"
+	"github.com/thesayfulla/cinema-booking-system/internal/adapters/postgres"
 	"github.com/thesayfulla/cinema-booking-system/internal/config"
 	"github.com/thesayfulla/cinema-booking-system/internal/domain"
-	"github.com/thesayfulla/cinema-booking-system/internal/logger"
+	"github.com/thesayfulla/cinema-booking-system/internal/metrics"
 	"github.com/thesayfulla/cinema-booking-system/internal/server"
 	"github.com/thesayfulla/cinema-booking-system/internal/usecase"
+	"github.com/thesayfulla/cinema-booking-system/internal/worker"
 )
 
-// Container holds all application dependencies.
-// This is the single place where all layers are wired together.
-// It follows dependency injection principles: dependencies flow through constructors,
-// not globals, making the app testable and modular.
+// Container holds the wired application. This is the one place that knows
+// which concrete adapters back the domain's interfaces; every other package
+// depends on the interfaces alone.
 type Container struct {
-	Config *config.Config
-	Logger *logger.Logger
-	Server *server.Server
-	Router *http.Router
+	Config  *config.Config
+	Log     *slog.Logger
+	DB      *postgres.DB
+	Server  *server.Server
+	Expirer *worker.HoldExpirer
 }
 
-// NewContainer bootstraps the entire application with proper dependency injection.
-// It's responsible for:
-// 1. Loading configuration
-// 2. Initializing infrastructure (logger, database)
-// 3. Creating use cases
-// 4. Creating HTTP handlers
-// 5. Wiring routes
-func NewContainer(ctx context.Context) (*Container, error) {
-	// Load configuration from environment
-	cfg := config.NewConfig()
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
 
-	// Initialize logger
-	log := logger.NewLogger()
-
-	// Initialize repository based on configuration
-	// This is the only place where storage implementation is chosen
-	var bookingRepo domain.BookingRepository
-
-	switch cfg.StorageBackend {
-	case "memory":
-		log.Info("using in-memory repository")
-		bookingRepo = memory.NewRepository()
-
-	case "redis":
-		log.Info("using redis repository")
-		rdb, err := redisAdapter.NewClient(cfg.RedisAddr, log)
-		if err != nil {
-			log.Fatal("failed to connect to redis: %v", err)
-		}
-		bookingRepo = redis.NewRepository(rdb)
-
-	default:
-		return nil, errors.New("invalid storage backend: " + cfg.StorageBackend)
+// NewContainer builds every dependency: configuration, database, repositories,
+// use cases, handlers, and the HTTP server.
+func NewContainer(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Container, error) {
+	db, err := postgres.Connect(ctx, postgres.Config{
+		DSN:             cfg.DB.DSN,
+		MaxConns:        cfg.DB.MaxConns,
+		MinConns:        cfg.DB.MinConns,
+		MaxConnLifetime: cfg.DB.MaxConnLifetime,
+		MaxConnIdleTime: cfg.DB.MaxConnIdleTime,
+		ConnectTimeout:  cfg.DB.ConnectTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 
-	// Initialize use cases
-	// Use cases depend only on domain interfaces (bookingRepo implements domain.BookingRepository)
-	bookingUC := usecase.NewBookingUsecase(bookingRepo)
+	if cfg.DB.AutoMigrate {
+		applied, err := db.Migrate(ctx)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("run migrations: %w", err)
+		}
+		if len(applied) > 0 {
+			log.Info("applied database migrations", "migrations", applied)
+		}
+	}
+	if cfg.DB.SeedDemoData {
+		if err := db.Seed(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
+		log.Info("seeded demo catalog data")
+	}
 
-	// Create HTTP handlers
-	// Handlers depend only on use cases
-	bookingHandler := http.NewBookingHandler(bookingUC)
-	moviesHandler := http.NewMoviesHandler()
+	// Repositories (adapters) satisfying the domain's ports.
+	catalogRepo := postgres.NewCatalogRepository(db)
+	bookingRepo := postgres.NewBookingRepository(db)
+	paymentRepo := postgres.NewPaymentRepository(db)
 
-	// Create router and register all routes
-	router := http.NewRouter(bookingHandler, moviesHandler)
+	// Payment provider. Adding a real gateway means another case here.
+	var (
+		provider     domain.PaymentProvider
+		mockProvider *mock.Provider
+	)
+	switch cfg.Pay.Provider {
+	case config.ProviderMock:
+		mockProvider = mock.New(cfg.Pay.WebhookSecret)
+		provider = mockProvider
+		log.Warn("using the mock payment provider; no real money moves")
+	default:
+		db.Close()
+		return nil, fmt.Errorf("unsupported payment provider %q", cfg.Pay.Provider)
+	}
 
-	// Create HTTP server
-	httpServer := server.NewServer(":"+cfg.HTTPPort, router.Handler(), log)
+	// Use cases.
+	catalogUC := usecase.NewCatalog(catalogRepo)
+	bookingUC := usecase.NewBooking(bookingRepo, catalogRepo, usecase.BookingPolicy{
+		HoldTTL:            cfg.Hold.TTL,
+		MaxSeatsPerBooking: cfg.Hold.MaxSeatsPerBooking,
+		BookingCutoff:      cfg.Hold.BookingCutoff,
+	})
+	paymentUC := usecase.NewPayment(paymentRepo, bookingRepo, provider, db, usecase.PaymentPolicy{
+		PaymentWindow: cfg.Pay.PaymentWindow,
+		RefundCutoff:  cfg.Pay.RefundCutoff,
+	}, log)
+
+	// Transport.
+	collector := metrics.New()
+	router := httpadapter.NewRouter(httpadapter.RouterDeps{
+		Config:  cfg,
+		Log:     log,
+		Metrics: collector,
+		Catalog: httpadapter.NewCatalogHandler(catalogUC, log),
+		Booking: httpadapter.NewBookingHandler(bookingUC, paymentUC, collector, log),
+		Payment: httpadapter.NewPaymentHandler(paymentUC, collector, log, mockProvider),
+		Health:  db.Ping,
+		Version: version,
+	})
 
 	return &Container{
-		Config: cfg,
-		Logger: log,
-		Server: httpServer,
-		Router: router,
+		Config:  cfg,
+		Log:     log,
+		DB:      db,
+		Server:  server.New(cfg.HTTP, router, log),
+		Expirer: worker.NewHoldExpirer(bookingUC, cfg.Hold.SweepInterval, cfg.Hold.SweepBatch, log, collector.HoldsReleased),
 	}, nil
+}
+
+// Close releases the container's resources.
+func (c *Container) Close() {
+	if c.DB != nil {
+		c.DB.Close()
+	}
 }

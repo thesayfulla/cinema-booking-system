@@ -52,11 +52,50 @@ header h1 {
     border-radius: 4px;
 }
 
-.movies {
+.section-title {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+    margin-bottom: 0.8rem;
+    font-weight: 600;
+}
+
+.movies,
+.showtimes {
     display: flex;
     gap: 1rem;
     margin-bottom: 2rem;
     flex-wrap: wrap;
+}
+
+.showtime-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1.2rem;
+    cursor: pointer;
+    transition:
+        border-color 0.2s,
+        background 0.2s;
+    min-width: 200px;
+}
+
+.showtime-card:hover,
+.showtime-card.selected {
+    background: var(--surface-hover);
+    border-color: var(--accent);
+}
+
+.showtime-card strong {
+    display: block;
+    font-size: 0.85rem;
+    margin-bottom: 0.35rem;
+}
+
+.showtime-card p {
+    font-size: 0.72rem;
+    color: var(--text-muted);
 }
 
 .movie-card {
@@ -157,9 +196,18 @@ header h1 {
         transform 0.15s;
 }
 
-.seat:hover:not(.seat--held-mine):not(.seat--held-other):not(.seat--confirmed) {
+.seat:hover:not(:disabled) {
     background: var(--available-hover);
     transform: scale(1.08);
+}
+
+.seat:disabled {
+    cursor: not-allowed;
+}
+
+.seat--selected {
+    background: var(--accent);
+    color: #000;
 }
 
 .seat--held-mine {
@@ -255,8 +303,18 @@ header h1 {
     transition: opacity 0.2s;
 }
 
-.btn:hover {
+.btn:hover:not(:disabled) {
     opacity: 0.85;
+}
+
+.btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.checkout-buttons {
+    flex-wrap: wrap;
+    margin-top: 0.8rem;
 }
 
 .btn--confirm {

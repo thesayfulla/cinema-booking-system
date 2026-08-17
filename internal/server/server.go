@@ -1,54 +1,72 @@
+// Package server runs the HTTP listener with a graceful shutdown.
 package server
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/thesayfulla/cinema-booking-system/internal/logger"
+	"github.com/thesayfulla/cinema-booking-system/internal/config"
 )
 
-// Server wraps http.Server with additional lifecycle management.
+// Server wraps http.Server with lifecycle management.
 type Server struct {
-	server *http.Server
-	logger *logger.Logger
+	http            *http.Server
+	log             *slog.Logger
+	shutdownTimeout time.Duration
 }
 
-// NewServer creates a new HTTP server.
-func NewServer(addr string, handler http.Handler, logger *logger.Logger) *Server {
+// New builds the HTTP server from configuration.
+func New(cfg config.HTTPConfig, handler http.Handler, log *slog.Logger) *Server {
 	return &Server{
-		server: &http.Server{
-			Addr:         addr,
-			Handler:      handler,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
+		http: &http.Server{
+			Addr:              ":" + cfg.Port,
+			Handler:           handler,
+			ReadTimeout:       cfg.ReadTimeout,
+			ReadHeaderTimeout: cfg.ReadTimeout,
+			WriteTimeout:      cfg.WriteTimeout,
+			IdleTimeout:       cfg.IdleTimeout,
+			ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 		},
-		logger: logger,
+		log:             log,
+		shutdownTimeout: cfg.ShutdownTimeout,
 	}
 }
 
-// Start starts the HTTP server (blocking).
-// Call in a goroutine if you need to run other code concurrently.
-func (s *Server) Start() error {
-	s.logger.Info("server starting on %s", s.server.Addr)
-	err := s.server.ListenAndServe()
-	if err != nil && err != http.ErrServerClosed {
+// Run serves until ctx is cancelled, then drains in-flight requests.
+//
+// Cancelling ctx (on SIGTERM, say) stops accepting new connections and gives
+// running handlers up to the shutdown timeout to finish, so a deploy does not
+// cut a checkout in half.
+func (s *Server) Run(ctx context.Context) error {
+	errCh := make(chan error, 1)
+
+	go func() {
+		s.log.Info("http server listening", "addr", s.http.Addr)
+		if err := s.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
 		return err
+	case <-ctx.Done():
+		s.log.Info("shutting down http server", "timeout", s.shutdownTimeout.String())
+
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout)
+		defer cancel()
+
+		if err := s.http.Shutdown(shutdownCtx); err != nil {
+			// Requests still running at the deadline are cut off here.
+			s.log.Error("graceful shutdown timed out; forcing close", "error", err)
+			return s.http.Close()
+		}
+		s.log.Info("http server stopped cleanly")
+		return nil
 	}
-	return nil
-}
-
-// Stop gracefully shuts down the server.
-func (s *Server) Stop() error {
-	s.logger.Info("shutting down server")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return s.server.Shutdown(ctx)
-}
-
-// Addr returns the server's listening address.
-func (s *Server) Addr() string {
-	return fmt.Sprintf("http://%s", s.server.Addr)
 }

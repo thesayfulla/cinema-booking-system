@@ -1,56 +1,102 @@
-
+// Demo UI for the booking API. It speaks the same endpoints a real client
+// would: browse the catalog, hold seats, start checkout, then let the mock
+// gateway call back through the webhook path.
 (function () {
-    const userID = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
-    document.getElementById("userBadge").textContent = "user: " + userID;
+    const API = "/api/v1";
+
+    // The user id stands in for a signed-in subject; the API reads it from the
+    // X-User-Id header. Keeping it in localStorage means a reload keeps your
+    // bookings instead of turning you into a stranger.
+    const userID = (function () {
+        let id = localStorage.getItem("cinema_user_id");
+        if (!id) {
+            id = "user_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+            localStorage.setItem("cinema_user_id", id);
+        }
+        return id;
+    })();
+    document.getElementById("userBadge").textContent = userID;
 
     let movies = [];
     let selectedMovie = null;
-    let activeSession = null; // { sessionID, movieID, seatID, expiresAt }
+    let selectedShowtime = null;
+    let selectedSeats = []; // seat ids picked but not yet held
+    let booking = null; // the active held/confirmed booking
+    let payment = null;
     let pollInterval = null;
     let timerInterval = null;
 
     // --- API helpers ---
 
-    function api(method, path, body) {
-        const opts = {
-            method,
-            headers: { "Content-Type": "application/json" },
-        };
+    function api(method, path, body, extraHeaders) {
+        const headers = { "X-User-Id": userID };
+        if (body) headers["Content-Type"] = "application/json";
+        Object.assign(headers, extraHeaders || {});
+
+        const opts = { method: method, headers: headers };
         if (body) opts.body = JSON.stringify(body);
-        return fetch(path, opts).then(function (r) {
+
+        return fetch(API + path, opts).then(function (r) {
             if (r.status === 204) return null;
-            return r.json().then(function (data) {
-                if (!r.ok) throw new Error(data.error || "request failed");
+            return r.text().then(function (text) {
+                let data = null;
+                if (text) {
+                    try {
+                        data = JSON.parse(text);
+                    } catch (e) {
+                        data = null;
+                    }
+                }
+                if (!r.ok) {
+                    const message =
+                        (data && data.error && data.error.message) ||
+                        "request failed (" + r.status + ")";
+                    throw new Error(message);
+                }
                 return data;
             });
         });
     }
 
-    // --- Movie list ---
+    function money(cents, currency) {
+        return (cents / 100).toFixed(2) + " " + (currency || "USD");
+    }
+
+    // --- Movies ---
 
     function loadMovies() {
-        api("GET", "/movies").then(function (data) {
-            movies = data;
-            renderMovies();
-        });
+        api("GET", "/movies")
+            .then(function (data) {
+                movies = data.movies || [];
+                renderMovies();
+            })
+            .catch(function (err) {
+                document.getElementById("movieList").innerHTML =
+                    '<div class="empty-state">' +
+                    escapeHtml(err.message) +
+                    "</div>";
+            });
     }
 
     function renderMovies() {
-        var container = document.getElementById("movieList");
+        const container = document.getElementById("movieList");
         container.innerHTML = "";
+        if (movies.length === 0) {
+            container.innerHTML =
+                '<div class="empty-state">No movies available</div>';
+            return;
+        }
         movies.forEach(function (m) {
-            var card = document.createElement("div");
+            const card = document.createElement("div");
             card.className =
                 "movie-card" +
                 (selectedMovie && selectedMovie.id === m.id ? " selected" : "");
-            card.innerHTML =
-                "<h3>" +
-                escapeHtml(m.title) +
-                "</h3><p>" +
-                m.rows +
-                " rows &times; " +
-                m.seats_per_row +
-                " seats</p>";
+            const title = document.createElement("h3");
+            title.textContent = m.title;
+            const meta = document.createElement("p");
+            meta.textContent = m.duration_minutes + " min";
+            card.appendChild(title);
+            card.appendChild(meta);
             card.addEventListener("click", function () {
                 selectMovie(m);
             });
@@ -58,255 +104,436 @@
         });
     }
 
-    function releaseActiveSession() {
-        if (!activeSession) return Promise.resolve();
-        var sid = activeSession.sessionID;
-        clearTimerInterval();
-        activeSession = null;
-        document.getElementById("checkoutArea").innerHTML = "";
-        return api("DELETE", "/sessions/" + sid, { user_id: userID }).catch(
-            function () { },
-        );
-    }
-
     function selectMovie(movie) {
-        releaseActiveSession();
         selectedMovie = movie;
+        selectedShowtime = null;
+        selectedSeats = [];
+        stopPolling();
         renderMovies();
-        document.getElementById("mainContent").style.display = "flex";
+        document.getElementById("mainContent").style.display = "none";
         document.getElementById("checkoutArea").innerHTML = "";
-        fetchSeats();
-        startPolling();
+        document.getElementById("showtimeSection").style.display = "block";
+        loadShowtimes();
     }
 
-    // --- Seat grid ---
+    // --- Showtimes ---
 
-    function fetchSeats() {
-        if (!selectedMovie) return;
-        api("GET", "/movies/" + selectedMovie.id + "/seats").then(
-            function (seats) {
-                renderGrid(seats);
+    function loadShowtimes() {
+        api("GET", "/movies/" + selectedMovie.id + "/showtimes").then(
+            function (data) {
+                renderShowtimes(data.showtimes || []);
             },
         );
     }
 
-    function renderGrid(seatStatuses) {
-        var grid = document.getElementById("seatGrid");
+    function renderShowtimes(showtimes) {
+        const container = document.getElementById("showtimeList");
+        container.innerHTML = "";
+        if (showtimes.length === 0) {
+            container.innerHTML =
+                '<div class="empty-state">No upcoming showtimes</div>';
+            return;
+        }
+        showtimes.forEach(function (s) {
+            const card = document.createElement("div");
+            card.className =
+                "showtime-card" +
+                (selectedShowtime && selectedShowtime.id === s.id
+                    ? " selected"
+                    : "");
+            const when = document.createElement("strong");
+            when.textContent = new Date(s.starts_at).toLocaleString();
+            const meta = document.createElement("p");
+            meta.textContent =
+                s.hall_name + " · from " + money(s.base_price_cents, s.currency);
+            card.appendChild(when);
+            card.appendChild(meta);
+            card.addEventListener("click", function () {
+                selectShowtime(s);
+            });
+            container.appendChild(card);
+        });
+    }
+
+    function selectShowtime(showtime) {
+        selectedShowtime = showtime;
+        selectedSeats = [];
+        booking = null;
+        payment = null;
+        clearTimer();
+        loadShowtimes(); // re-render so the picked showtime is highlighted
+        document.getElementById("mainContent").style.display = "flex";
+        renderSidePanel();
+        fetchSeats();
+        startPolling();
+    }
+
+    // --- Seat map ---
+
+    function fetchSeats() {
+        if (!selectedShowtime) return;
+        api("GET", "/showtimes/" + selectedShowtime.id + "/seats")
+            .then(function (data) {
+                renderGrid(data.seats || []);
+            })
+            .catch(function () {
+                /* a transient poll failure is not worth a banner */
+            });
+    }
+
+    function renderGrid(seats) {
+        const grid = document.getElementById("seatGrid");
         grid.innerHTML = "";
-        var statusMap = {};
-        seatStatuses.forEach(function (s) {
-            statusMap[s.seat_id] = s;
+
+        // Group by row so the map reads like the auditorium.
+        const rows = {};
+        const order = [];
+        seats.forEach(function (s) {
+            if (!rows[s.row_label]) {
+                rows[s.row_label] = [];
+                order.push(s.row_label);
+            }
+            rows[s.row_label].push(s);
         });
 
-        var rowLabels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        for (var r = 0; r < selectedMovie.rows; r++) {
-            var rowDiv = document.createElement("div");
+        order.forEach(function (label) {
+            const rowDiv = document.createElement("div");
             rowDiv.className = "seat-row";
-            var label = document.createElement("div");
-            label.className = "row-label";
-            label.textContent = rowLabels[r];
-            rowDiv.appendChild(label);
 
-            for (var s = 1; s <= selectedMovie.seats_per_row; s++) {
-                var seatID = rowLabels[r] + s;
-                var btn = document.createElement("button");
-                btn.className = "seat";
-                btn.textContent = s;
-                btn.dataset.seatId = seatID;
+            const left = document.createElement("div");
+            left.className = "row-label";
+            left.textContent = label;
+            rowDiv.appendChild(left);
 
-                var info = statusMap[seatID];
-                if (info) {
-                    if (info.confirmed) {
-                        btn.classList.add("seat--confirmed");
-                    } else if (info.booked && info.user_id === userID) {
-                        btn.classList.add("seat--held-mine");
-                    } else if (info.booked) {
-                        btn.classList.add("seat--held-other");
-                    }
-                }
+            rows[label].forEach(function (seat) {
+                rowDiv.appendChild(seatButton(seat));
+            });
 
-                (function (id) {
-                    btn.addEventListener("click", function () {
-                        holdSeat(id);
-                    });
-                })(seatID);
+            const right = document.createElement("div");
+            right.className = "row-label";
+            right.textContent = label;
+            rowDiv.appendChild(right);
 
-                rowDiv.appendChild(btn);
-            }
-
-            var labelRight = document.createElement("div");
-            labelRight.className = "row-label";
-            labelRight.textContent = rowLabels[r];
-            rowDiv.appendChild(labelRight);
             grid.appendChild(rowDiv);
-        }
+        });
     }
 
-    // --- Hold / Confirm / Release ---
+    function seatButton(seat) {
+        const btn = document.createElement("button");
+        btn.className = "seat";
+        btn.textContent = seat.seat_number;
+        btn.title =
+            seat.row_label +
+            seat.seat_number +
+            " · " +
+            seat.seat_class +
+            " · " +
+            money(seat.price_cents, selectedShowtime.currency);
 
-    function holdSeat(seatID) {
-        if (activeSession) return; // already holding a seat
+        if (seat.status === "sold") {
+            btn.classList.add("seat--confirmed");
+        } else if (seat.status === "held" && seat.mine) {
+            btn.classList.add("seat--held-mine");
+        } else if (seat.status === "held") {
+            btn.classList.add("seat--held-other");
+        } else if (selectedSeats.indexOf(seat.id) !== -1) {
+            btn.classList.add("seat--selected");
+        }
+
+        const selectable = seat.status === "available" && !booking;
+        if (!selectable) {
+            btn.disabled = true;
+        } else {
+            btn.addEventListener("click", function () {
+                toggleSeat(seat);
+            });
+        }
+        return btn;
+    }
+
+    function toggleSeat(seat) {
+        const i = selectedSeats.indexOf(seat.id);
+        if (i === -1) {
+            selectedSeats.push(seat.id);
+        } else {
+            selectedSeats.splice(i, 1);
+        }
+        fetchSeats();
+        renderSidePanel();
+    }
+
+    // --- Booking ---
+
+    function holdSeats() {
+        if (selectedSeats.length === 0) return;
         api(
             "POST",
-            "/movies/" + selectedMovie.id + "/seats/" + seatID + "/hold",
-            { user_id: userID },
+            "/bookings",
+            {
+                showtime_id: selectedShowtime.id,
+                seat_ids: selectedSeats,
+            },
+            // A retried click must not reserve a second set of seats.
+            { "Idempotency-Key": crypto.randomUUID() },
         )
             .then(function (data) {
-                activeSession = {
-                    sessionID: data.session_id,
-                    movieID: data.movie_id,
-                    seatID: data.seat_id,
-                    expiresAt: new Date(data.expires_at),
-                };
-                fetchSeats();
-                renderCheckout();
+                booking = data;
+                payment = null;
+                selectedSeats = [];
                 startTimer();
-            })
-            .catch(function (err) {
-                showCheckoutStatus(err.message, "error");
-            });
-    }
-
-    function confirmSeat() {
-        if (!activeSession) return;
-        api("PUT", "/sessions/" + activeSession.sessionID + "/confirm", {
-            user_id: userID,
-        })
-            .then(function () {
-                clearTimerInterval();
-                activeSession = null;
                 fetchSeats();
-                showCheckoutStatus("Confirmed!", "success");
+                renderSidePanel();
             })
             .catch(function (err) {
-                showCheckoutStatus(err.message, "error");
-            });
-    }
-
-    function releaseSeat() {
-        if (!activeSession) return;
-        api("DELETE", "/sessions/" + activeSession.sessionID, {
-            user_id: userID,
-        })
-            .then(function () {
-                clearTimerInterval();
-                activeSession = null;
+                renderSidePanel(err.message);
                 fetchSeats();
-                document.getElementById("checkoutArea").innerHTML = "";
-            })
-            .catch(function (err) {
-                showCheckoutStatus(err.message, "error");
             });
     }
 
-    // --- Checkout panel ---
-
-    function renderCheckout() {
-        if (!activeSession) return;
-        var area = document.getElementById("checkoutArea");
-        area.innerHTML =
-            '<div class="checkout">' +
-            "<h3>Checkout</h3>" +
-            '<div class="checkout-info"><span>Seat:</span> ' +
-            escapeHtml(activeSession.seatID) +
-            "</div>" +
-            '<div class="checkout-info"><span>Movie:</span> ' +
-            escapeHtml(activeSession.movieID) +
-            "</div>" +
-            '<div class="checkout-info"><span>Session:</span> ' +
-            activeSession.sessionID.slice(0, 8) +
-            "&hellip;</div>" +
-            '<div class="timer" id="timer">--:--</div>' +
-            '<div class="checkout-buttons">' +
-            '<button class="btn btn--confirm" id="btnConfirm">Confirm</button>' +
-            '<button class="btn btn--release" id="btnRelease">Release</button>' +
-            "</div>" +
-            '<div id="checkoutStatus"></div>' +
-            "</div>";
-        document
-            .getElementById("btnConfirm")
-            .addEventListener("click", confirmSeat);
-        document
-            .getElementById("btnRelease")
-            .addEventListener("click", releaseSeat);
+    function releaseBooking() {
+        if (!booking) return;
+        api("DELETE", "/bookings/" + booking.id)
+            .then(function () {
+                booking = null;
+                payment = null;
+                clearTimer();
+                fetchSeats();
+                renderSidePanel("Booking released");
+            })
+            .catch(function (err) {
+                renderSidePanel(err.message);
+            });
     }
 
-    function showCheckoutStatus(msg, type) {
-        var area = document.getElementById("checkoutArea");
-        area.innerHTML =
-            '<div class="checkout">' +
-            '<div class="status-msg ' +
-            type +
-            '">' +
-            escapeHtml(msg) +
-            "</div>" +
-            "</div>";
-        setTimeout(function () {
-            if (!activeSession) area.innerHTML = "";
-        }, 3000);
+    // --- Checkout ---
+
+    function startCheckout() {
+        if (!booking) return;
+        api("POST", "/bookings/" + booking.id + "/checkout")
+            .then(function (data) {
+                payment = data;
+                renderSidePanel();
+            })
+            .catch(function (err) {
+                renderSidePanel(err.message);
+            });
     }
 
-    // --- Timer ---
+    // simulatePayment stands in for the customer finishing on the gateway's
+    // page: the server builds a signed callback and feeds it through the very
+    // webhook path a real provider would use.
+    function simulatePayment(outcome) {
+        if (!payment) return;
+        api("POST", "/payments/" + payment.id + "/simulate", {
+            outcome: outcome,
+        })
+            .then(function (data) {
+                payment = data;
+                return api("GET", "/bookings/" + booking.id);
+            })
+            .then(function (data) {
+                booking = data;
+                if (booking.status === "confirmed") clearTimer();
+                fetchSeats();
+                renderSidePanel();
+            })
+            .catch(function (err) {
+                renderSidePanel(err.message);
+            });
+    }
+
+    function reset() {
+        booking = null;
+        payment = null;
+        selectedSeats = [];
+        clearTimer();
+        fetchSeats();
+        renderSidePanel();
+    }
+
+    // --- Side panel ---
+
+    function renderSidePanel(message) {
+        const area = document.getElementById("checkoutArea");
+        area.innerHTML = "";
+
+        const panel = document.createElement("div");
+        panel.className = "checkout";
+
+        if (!booking) {
+            panel.appendChild(heading("Selection"));
+            panel.appendChild(
+                info("Seats", selectedSeats.length ? selectedSeats.length : "—"),
+            );
+            panel.appendChild(
+                button(
+                    "Hold seats",
+                    "btn--confirm",
+                    holdSeats,
+                    selectedSeats.length === 0,
+                ),
+            );
+        } else {
+            panel.appendChild(heading("Booking " + booking.reference));
+            panel.appendChild(info("Status", booking.status));
+            panel.appendChild(
+                info(
+                    "Seats",
+                    booking.seats
+                        .map(function (s) {
+                            return s.row_label + s.seat_number;
+                        })
+                        .join(", "),
+                ),
+            );
+            panel.appendChild(
+                info(
+                    "Total",
+                    money(booking.total_amount_cents, booking.currency),
+                ),
+            );
+
+            if (booking.status === "held") {
+                const timer = document.createElement("div");
+                timer.className = "timer";
+                timer.id = "timer";
+                timer.textContent = "--:--";
+                panel.appendChild(timer);
+
+                const buttons = document.createElement("div");
+                buttons.className = "checkout-buttons";
+                if (!payment) {
+                    buttons.appendChild(
+                        button("Pay", "btn--confirm", startCheckout),
+                    );
+                } else {
+                    buttons.appendChild(
+                        button("Complete", "btn--confirm", function () {
+                            simulatePayment("success");
+                        }),
+                    );
+                    buttons.appendChild(
+                        button("Decline", "btn--release", function () {
+                            simulatePayment("failure");
+                        }),
+                    );
+                }
+                buttons.appendChild(
+                    button("Release", "btn--release", releaseBooking),
+                );
+                panel.appendChild(buttons);
+
+                if (payment) {
+                    panel.appendChild(info("Payment", payment.status));
+                }
+            } else {
+                const buttons = document.createElement("div");
+                buttons.className = "checkout-buttons";
+                if (booking.status === "confirmed") {
+                    buttons.appendChild(
+                        button("Cancel & refund", "btn--release", releaseBooking),
+                    );
+                }
+                buttons.appendChild(button("New booking", "btn--confirm", reset));
+                panel.appendChild(buttons);
+            }
+        }
+
+        if (message) {
+            const status = document.createElement("div");
+            status.className =
+                "status-msg " +
+                (booking && booking.status === "confirmed" ? "success" : "error");
+            status.textContent = message;
+            panel.appendChild(status);
+        }
+
+        area.appendChild(panel);
+        updateTimer();
+    }
+
+    function heading(text) {
+        const h = document.createElement("h3");
+        h.textContent = text;
+        return h;
+    }
+
+    function info(label, value) {
+        const div = document.createElement("div");
+        div.className = "checkout-info";
+        const span = document.createElement("span");
+        span.textContent = label + ": ";
+        div.appendChild(span);
+        div.appendChild(document.createTextNode(String(value)));
+        return div;
+    }
+
+    function button(text, variant, onClick, disabled) {
+        const btn = document.createElement("button");
+        btn.className = "btn " + variant;
+        btn.textContent = text;
+        btn.disabled = !!disabled;
+        btn.addEventListener("click", onClick);
+        return btn;
+    }
+
+    // --- Hold timer ---
 
     function startTimer() {
-        clearTimerInterval();
+        clearTimer();
         updateTimer();
         timerInterval = setInterval(updateTimer, 1000);
     }
 
     function updateTimer() {
-        if (!activeSession) {
-            clearTimerInterval();
-            return;
-        }
-        var el = document.getElementById("timer");
-        if (!el) return;
-        var remaining = Math.max(
+        const el = document.getElementById("timer");
+        if (!el || !booking || !booking.expires_at) return;
+
+        const remaining = Math.max(
             0,
-            Math.floor((activeSession.expiresAt - Date.now()) / 1000),
+            Math.floor((new Date(booking.expires_at) - Date.now()) / 1000),
         );
-        var mins = Math.floor(remaining / 60);
-        var secs = remaining % 60;
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
         el.textContent =
             String(mins).padStart(2, "0") + ":" + String(secs).padStart(2, "0");
-
-        if (remaining < 60) {
-            el.classList.add("urgent");
-        } else {
-            el.classList.remove("urgent");
-        }
+        el.classList.toggle("urgent", remaining < 60);
 
         if (remaining <= 0) {
-            clearTimerInterval();
-            activeSession = null;
+            clearTimer();
+            booking = null;
+            payment = null;
             fetchSeats();
-            showCheckoutStatus("Hold expired", "error");
+            renderSidePanel("Hold expired");
         }
     }
 
-    function clearTimerInterval() {
+    function clearTimer() {
         if (timerInterval) {
             clearInterval(timerInterval);
             timerInterval = null;
         }
     }
 
-    // --- Polling ---
+    // --- Polling: other people's holds show up without a reload ---
 
     function startPolling() {
-        if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(fetchSeats, 2000);
+        stopPolling();
+        pollInterval = setInterval(fetchSeats, 3000);
     }
 
-    // --- Util ---
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+    }
 
     function escapeHtml(str) {
-        var div = document.createElement("div");
+        const div = document.createElement("div");
         div.textContent = str;
         return div.innerHTML;
     }
-
-    // --- Init ---
 
     loadMovies();
 })();

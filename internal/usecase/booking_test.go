@@ -1,148 +1,327 @@
-package usecase
+package usecase_test
 
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/thesayfulla/cinema-booking-system/internal/domain"
+	"github.com/thesayfulla/cinema-booking-system/internal/usecase"
 )
 
-// MockRepository is a test double for domain.BookingRepository
-type MockRepository struct {
-	holdFunc           func(context.Context, domain.Booking) (domain.Booking, error)
-	listByMovieFunc    func(context.Context, string) ([]domain.Booking, error)
-	confirmFunc        func(context.Context, string, string) (domain.Booking, error)
-	releaseFunc        func(context.Context, string, string) error
+const (
+	seatA1 = "aaaa1111-0000-4000-8000-000000000001"
+	seatA2 = "aaaa1111-0000-4000-8000-000000000002"
+	seatA3 = "aaaa1111-0000-4000-8000-000000000003"
+)
+
+func newBookingUC(t *testing.T, policy usecase.BookingPolicy) (*usecase.Booking, *fakeBookings, *fakeCatalog) {
+	t.Helper()
+	catalog := newFakeCatalog(24*time.Hour, seatA1, seatA2, seatA3)
+	bookings := newFakeBookings()
+	return usecase.NewBooking(bookings, catalog, policy), bookings, catalog
 }
 
-func (m *MockRepository) Hold(ctx context.Context, booking domain.Booking) (domain.Booking, error) {
-	return m.holdFunc(ctx, booking)
-}
+func TestHoldSeatsReservesRequestedSeats(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
 
-func (m *MockRepository) ListByMovie(ctx context.Context, movieID string) ([]domain.Booking, error) {
-	return m.listByMovieFunc(ctx, movieID)
-}
-
-func (m *MockRepository) Confirm(ctx context.Context, sessionID string, userID string) (domain.Booking, error) {
-	return m.confirmFunc(ctx, sessionID, userID)
-}
-
-func (m *MockRepository) Release(ctx context.Context, sessionID string, userID string) error {
-	return m.releaseFunc(ctx, sessionID, userID)
-}
-
-func TestHoldSeat_Success(t *testing.T) {
-	mockRepo := &MockRepository{
-		holdFunc: func(ctx context.Context, booking domain.Booking) (domain.Booking, error) {
-			booking.ID = "session-123"
-			booking.Status = "held"
-			booking.ExpiresAt = time.Now().Add(2 * time.Minute)
-			return booking, nil
-		},
-	}
-
-	uc := NewBookingUsecase(mockRepo)
-	booking, err := uc.HoldSeat(context.Background(), "inception", "A1", "user123")
-
+	booking, err := uc.HoldSeats(context.Background(), usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID,
+		SeatIDs:    []string{seatA1, seatA2},
+		UserID:     "user-1",
+	})
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if booking.ID == "" {
-		t.Error("expected session ID to be set")
-	}
-	if booking.Status != "held" {
-		t.Errorf("expected status 'held', got %s", booking.Status)
-	}
-}
-
-func TestHoldSeat_SeatAlreadyBooked(t *testing.T) {
-	mockRepo := &MockRepository{
-		holdFunc: func(ctx context.Context, booking domain.Booking) (domain.Booking, error) {
-			return domain.Booking{}, domain.ErrSeatAlreadyBooked
-		},
+		t.Fatalf("HoldSeats: %v", err)
 	}
 
-	uc := NewBookingUsecase(mockRepo)
-	_, err := uc.HoldSeat(context.Background(), "inception", "A1", "user123")
-
-	if !errors.Is(err, domain.ErrSeatAlreadyBooked) {
-		t.Errorf("expected ErrSeatAlreadyBooked, got %v", err)
+	if booking.Status != domain.BookingHeld {
+		t.Errorf("status = %q, want %q", booking.Status, domain.BookingHeld)
+	}
+	if len(booking.Seats) != 2 {
+		t.Errorf("seats = %d, want 2", len(booking.Seats))
+	}
+	// Two standard seats at the showtime's base price.
+	if want := int64(2000); booking.TotalAmountCents != want {
+		t.Errorf("total = %d, want %d", booking.TotalAmountCents, want)
+	}
+	if booking.HoldExpiresAt == nil || !booking.HoldExpiresAt.After(time.Now()) {
+		t.Error("expected a hold expiry in the future")
 	}
 }
 
-func TestConfirmSession_Success(t *testing.T) {
-	mockRepo := &MockRepository{
-		confirmFunc: func(ctx context.Context, sessionID string, userID string) (domain.Booking, error) {
-			return domain.Booking{
-				ID:      sessionID,
-				MovieID: "inception",
-				SeatID:  "A1",
-				UserID:  userID,
-				Status:  "confirmed",
-			}, nil
-		},
+func TestHoldSeatsRejectsSeatAlreadyHeld(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	if _, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-1",
+	}); err != nil {
+		t.Fatalf("first hold: %v", err)
 	}
 
-	uc := NewBookingUsecase(mockRepo)
-	booking, err := uc.ConfirmSession(context.Background(), "session-123", "user123")
+	_, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-2",
+	})
+	if !errors.Is(err, domain.ErrSeatUnavailable) {
+		t.Fatalf("err = %v, want ErrSeatUnavailable", err)
+	}
+}
 
+// A hold covering several seats must not leave a partial reservation behind
+// when one of the seats is taken.
+func TestHoldSeatsIsAllOrNothing(t *testing.T) {
+	uc, repo, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	if _, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA2}, UserID: "user-1",
+	}); err != nil {
+		t.Fatalf("first hold: %v", err)
+	}
+
+	_, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1, seatA2, seatA3}, UserID: "user-2",
+	})
+	if !errors.Is(err, domain.ErrSeatUnavailable) {
+		t.Fatalf("err = %v, want ErrSeatUnavailable", err)
+	}
+
+	// Seats A1 and A3 must be free for the next customer.
+	if _, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1, seatA3}, UserID: "user-3",
+	}); err != nil {
+		t.Fatalf("seats were left claimed by the failed hold: %v", err)
+	}
+
+	if got := len(repo.claims); got != 3 {
+		t.Errorf("active claims = %d, want 3", got)
+	}
+}
+
+// Only one of many simultaneous requests for the same seat may win.
+func TestHoldSeatsConcurrentRequestsProduceOneWinner(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+
+	const contenders = 25
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		wins      int
+		conflicts int
+	)
+
+	start := make(chan struct{})
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			<-start
+
+			_, err := uc.HoldSeats(context.Background(), usecase.HoldSeatsInput{
+				ShowtimeID: catalog.showtime.ID,
+				SeatIDs:    []string{seatA1},
+				UserID:     "user-" + itoa(n),
+			})
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				wins++
+			case errors.Is(err, domain.ErrSeatUnavailable):
+				conflicts++
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+
+	if wins != 1 {
+		t.Errorf("winners = %d, want exactly 1", wins)
+	}
+	if conflicts != contenders-1 {
+		t.Errorf("conflicts = %d, want %d", conflicts, contenders-1)
+	}
+}
+
+func TestHoldSeatsIsIdempotent(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	in := usecase.HoldSeatsInput{
+		ShowtimeID:     catalog.showtime.ID,
+		SeatIDs:        []string{seatA1},
+		UserID:         "user-1",
+		IdempotencyKey: "checkout-42",
+	}
+
+	first, err := uc.HoldSeats(ctx, in)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("first hold: %v", err)
 	}
-	if booking.Status != "confirmed" {
-		t.Errorf("expected status 'confirmed', got %s", booking.Status)
-	}
-}
-
-func TestConfirmSession_NotFound(t *testing.T) {
-	mockRepo := &MockRepository{
-		confirmFunc: func(ctx context.Context, sessionID string, userID string) (domain.Booking, error) {
-			return domain.Booking{}, domain.ErrSessionNotFound
-		},
-	}
-
-	uc := NewBookingUsecase(mockRepo)
-	_, err := uc.ConfirmSession(context.Background(), "nonexistent", "user123")
-
-	if !errors.Is(err, domain.ErrSessionNotFound) {
-		t.Errorf("expected ErrSessionNotFound, got %v", err)
-	}
-}
-
-func TestReleaseSession_Success(t *testing.T) {
-	mockRepo := &MockRepository{
-		releaseFunc: func(ctx context.Context, sessionID string, userID string) error {
-			return nil
-		},
-	}
-
-	uc := NewBookingUsecase(mockRepo)
-	err := uc.ReleaseSession(context.Background(), "session-123", "user123")
-
+	second, err := uc.HoldSeats(ctx, in)
 	if err != nil {
-		t.Errorf("expected no error, got %v", err)
+		t.Fatalf("replayed hold: %v", err)
+	}
+
+	if first.ID != second.ID {
+		t.Errorf("replay created a new booking: %s vs %s", first.ID, second.ID)
 	}
 }
 
-func TestListSeats_Success(t *testing.T) {
-	mockRepo := &MockRepository{
-		listByMovieFunc: func(ctx context.Context, movieID string) ([]domain.Booking, error) {
-			return []domain.Booking{
-				{ID: "s1", MovieID: movieID, SeatID: "A1", UserID: "user1", Status: "held"},
-				{ID: "s2", MovieID: movieID, SeatID: "A2", UserID: "user2", Status: "confirmed"},
-			}, nil
+func TestHoldSeatsValidation(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute, MaxSeatsPerBooking: 2})
+
+	tests := []struct {
+		name string
+		in   usecase.HoldSeatsInput
+		want error
+	}{
+		{
+			name: "no user",
+			in:   usecase.HoldSeatsInput{ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}},
+			want: domain.ErrValidation,
+		},
+		{
+			name: "no seats",
+			in:   usecase.HoldSeatsInput{ShowtimeID: catalog.showtime.ID, UserID: "user-1"},
+			want: domain.ErrValidation,
+		},
+		{
+			name: "too many seats",
+			in: usecase.HoldSeatsInput{ShowtimeID: catalog.showtime.ID, UserID: "user-1",
+				SeatIDs: []string{seatA1, seatA2, seatA3}},
+			want: domain.ErrValidation,
+		},
+		{
+			name: "duplicate seat",
+			in: usecase.HoldSeatsInput{ShowtimeID: catalog.showtime.ID, UserID: "user-1",
+				SeatIDs: []string{seatA1, seatA1}},
+			want: domain.ErrValidation,
+		},
+		{
+			name: "unknown showtime",
+			in:   usecase.HoldSeatsInput{ShowtimeID: "nope", UserID: "user-1", SeatIDs: []string{seatA1}},
+			want: domain.ErrShowtimeNotFound,
+		},
+		{
+			name: "seat from another hall",
+			in: usecase.HoldSeatsInput{ShowtimeID: catalog.showtime.ID, UserID: "user-1",
+				SeatIDs: []string{"ffff1111-0000-4000-8000-000000000009"}},
+			want: domain.ErrSeatNotFound,
 		},
 	}
 
-	uc := NewBookingUsecase(mockRepo)
-	bookings, err := uc.ListSeats(context.Background(), "inception")
-
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := uc.HoldSeats(context.Background(), tt.in); !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+		})
 	}
-	if len(bookings) != 2 {
-		t.Errorf("expected 2 bookings, got %d", len(bookings))
+}
+
+// Sales stop shortly before the screening starts.
+func TestHoldSeatsRejectsShowtimePastCutoff(t *testing.T) {
+	catalog := newFakeCatalog(5*time.Minute, seatA1)
+	uc := usecase.NewBooking(newFakeBookings(), catalog, usecase.BookingPolicy{
+		HoldTTL:       5 * time.Minute,
+		BookingCutoff: 10 * time.Minute,
+	})
+
+	_, err := uc.HoldSeats(context.Background(), usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-1",
+	})
+	if !errors.Is(err, domain.ErrShowtimeStarted) {
+		t.Fatalf("err = %v, want ErrShowtimeStarted", err)
+	}
+}
+
+func TestHoldSeatsRejectsCancelledShowtime(t *testing.T) {
+	catalog := newFakeCatalog(24*time.Hour, seatA1)
+	catalog.showtime.Status = domain.ShowtimeCancelled
+	uc := usecase.NewBooking(newFakeBookings(), catalog, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+
+	_, err := uc.HoldSeats(context.Background(), usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-1",
+	})
+	if !errors.Is(err, domain.ErrShowtimeCanceled) {
+		t.Fatalf("err = %v, want ErrShowtimeCanceled", err)
+	}
+}
+
+// An expired hold frees its seat for the next customer.
+func TestExpiredHoldReleasesSeat(t *testing.T) {
+	uc, repo, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	first, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("first hold: %v", err)
+	}
+
+	repo.expire(first.ID)
+
+	if _, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-2",
+	}); err != nil {
+		t.Fatalf("seat was not released after the hold lapsed: %v", err)
+	}
+
+	// The lapsed booking reads back as expired even before the sweeper runs.
+	stale, err := uc.Get(ctx, first.ID, "user-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stale.Status != domain.BookingExpired {
+		t.Errorf("status = %q, want %q", stale.Status, domain.BookingExpired)
+	}
+}
+
+func TestGetHidesOtherUsersBookings(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	booking, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "owner",
+	})
+	if err != nil {
+		t.Fatalf("HoldSeats: %v", err)
+	}
+
+	if _, err := uc.Get(ctx, booking.ID, "someone-else"); !errors.Is(err, domain.ErrBookingNotFound) {
+		t.Fatalf("err = %v, want ErrBookingNotFound", err)
+	}
+}
+
+func TestReleaseFreesSeatAndRejectsNonOwner(t *testing.T) {
+	uc, _, catalog := newBookingUC(t, usecase.BookingPolicy{HoldTTL: 5 * time.Minute})
+	ctx := context.Background()
+
+	booking, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "owner",
+	})
+	if err != nil {
+		t.Fatalf("HoldSeats: %v", err)
+	}
+
+	if err := uc.Release(ctx, booking.ID, "intruder"); !errors.Is(err, domain.ErrBookingNotFound) {
+		t.Fatalf("err = %v, want ErrBookingNotFound", err)
+	}
+	if err := uc.Release(ctx, booking.ID, "owner"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	if _, err := uc.HoldSeats(ctx, usecase.HoldSeatsInput{
+		ShowtimeID: catalog.showtime.ID, SeatIDs: []string{seatA1}, UserID: "user-2",
+	}); err != nil {
+		t.Fatalf("seat not free after release: %v", err)
 	}
 }

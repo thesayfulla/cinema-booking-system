@@ -12,7 +12,15 @@
       <div class="user-id" id="userBadge"></div>
     </header>
 
-    <div class="movies" id="movieList"></div>
+    <section>
+      <h2 class="section-title">Now showing</h2>
+      <div class="movies" id="movieList"></div>
+    </section>
+
+    <section id="showtimeSection" style="display: none">
+      <h2 class="section-title">Showtimes</h2>
+      <div class="showtimes" id="showtimeList"></div>
+    </section>
 
     <div class="content" id="mainContent" style="display: none">
       <div class="screen-area">
@@ -26,6 +34,10 @@
               style="background: var(--available)"
             ></div>
             Available
+          </div>
+          <div class="legend-item">
+            <div class="legend-swatch" style="background: var(--accent)"></div>
+            Selected
           </div>
           <div class="legend-item">
             <div
@@ -46,7 +58,7 @@
               class="legend-swatch"
               style="background: var(--confirmed)"
             ></div>
-            Confirmed
+            Sold
           </div>
         </div>
       </div>
